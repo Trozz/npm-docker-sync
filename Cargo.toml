@@ -26,6 +26,7 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 rand = "0.9"
 
 [dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
 wiremock = "0.6"
 testcontainers = "0.27"
 pretty_assertions = "1"
