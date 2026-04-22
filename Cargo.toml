@@ -22,7 +22,7 @@ async-trait = "0.1"
 humantime-serde = "1"
 url = "2"
 futures-util = "0.3"
-time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 rand = "0.9"
 
 [dev-dependencies]
