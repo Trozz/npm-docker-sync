@@ -13,7 +13,8 @@ pub struct ContainerSpec {
     pub network_aliases: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Scheme {
     Http,
     Https,
