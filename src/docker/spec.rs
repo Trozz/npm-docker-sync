@@ -19,6 +19,27 @@ pub enum Scheme {
     Https,
 }
 
+#[allow(clippy::derivable_impls)]
+impl Default for Scheme {
+    fn default() -> Self {
+        Scheme::Http
+    }
+}
+
+impl std::str::FromStr for Scheme {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("https") {
+            Ok(Scheme::Https)
+        } else if s.eq_ignore_ascii_case("http") {
+            Ok(Scheme::Http)
+        } else {
+            Err(())
+        }
+    }
+}
+
 impl ContainerSpec {
     #[cfg(test)]
     pub fn stub(id: &str, url: &str) -> Self {
