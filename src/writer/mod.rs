@@ -59,7 +59,7 @@ impl NpmWriter {
     pub async fn run(mut self) {
         // Seed cache from NPM on startup.
         let npm = &self.npm;
-        match with_retry(npm, || npm.list_proxy_hosts()).await {
+        match with_retry(npm, "list", || npm.list_proxy_hosts()).await {
             Ok(hosts) => {
                 for h in hosts {
                     if let Some(m) = meta::decode(&h.meta) {
@@ -115,7 +115,7 @@ impl NpmWriter {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let forward_host = self.forward_host_for(spec);
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         let existing = hosts
             .iter()
             .find(|h| h.domain_names.iter().any(|d| d == &spec.url));
@@ -140,7 +140,7 @@ impl NpmWriter {
                 ) {
                     let host_id = h.id;
                     let npm = &self.npm;
-                    with_retry(npm, || npm.update_proxy_host(host_id, &patch)).await?;
+                    with_retry(npm, "update", || npm.update_proxy_host(host_id, &patch)).await?;
                 }
                 self.cache.insert(container_id.to_string(), h.id);
             }
@@ -169,7 +169,7 @@ impl NpmWriter {
                     access_list_id: 0,
                 };
                 let npm = &self.npm;
-                let created = with_retry(npm, || npm.create_proxy_host(&body)).await?;
+                let created = with_retry(npm, "create", || npm.create_proxy_host(&body)).await?;
                 self.cache.insert(container_id.to_string(), created.id);
 
                 if spec.ssl {
@@ -187,13 +187,14 @@ impl NpmWriter {
                         dns_provider_credentials: credentials,
                     };
                     let npm = &self.npm;
-                    let cert_id = with_retry(npm, || npm.request_certificate(&cert_req)).await?;
+                    let cert_id =
+                        with_retry(npm, "cert", || npm.request_certificate(&cert_req)).await?;
                     let mut patch = serde_json::Map::new();
                     patch.insert("certificate_id".into(), serde_json::Value::from(cert_id));
                     patch.insert("ssl_forced".into(), serde_json::Value::from(true));
                     let patch = UpdateProxyHost(patch);
                     let npm = &self.npm;
-                    with_retry(npm, || npm.update_proxy_host(created.id, &patch)).await?;
+                    with_retry(npm, "update", || npm.update_proxy_host(created.id, &patch)).await?;
                 }
             }
         }
@@ -212,7 +213,7 @@ impl NpmWriter {
             None => return Ok(()),
         };
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
             self.cache.remove(container_id);
             return Ok(());
@@ -226,7 +227,7 @@ impl NpmWriter {
             return Ok(());
         }
         let npm = &self.npm;
-        with_retry(npm, || npm.delete_proxy_host(host_id)).await?;
+        with_retry(npm, "delete", || npm.delete_proxy_host(host_id)).await?;
         self.cache.remove(container_id);
         Ok(())
     }

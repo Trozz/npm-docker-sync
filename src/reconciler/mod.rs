@@ -90,7 +90,7 @@ impl Reconciler {
             }
         }
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         for intent in plan::plan(&specs, &hosts) {
             let _ = self.tx.send(intent).await;
         }
