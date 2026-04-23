@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::docker::{DockerClient, labels};
 use crate::intent::Intent;
 use crate::npm::NpmClient;
+use crate::writer::retry_npm::with_retry;
 
 pub struct Reconciler {
     pub docker: DockerClient,
@@ -63,18 +64,38 @@ impl Reconciler {
                 .collect();
             ports.sort_unstable();
             ports.dedup();
+            let mut aliases = BTreeMap::new();
+            if let Some(ns) = insp
+                .network_settings
+                .as_ref()
+                .and_then(|n| n.networks.clone())
+            {
+                for (net, net_cfg) in ns {
+                    if let Some(ip) = net_cfg.ip_address {
+                        if !ip.is_empty() {
+                            aliases.insert(format!("{net}:ip"), ip);
+                        }
+                    }
+                    if let Some(ref ar) = net_cfg.aliases {
+                        for a in ar {
+                            aliases.insert(format!("{net}:alias"), a.clone());
+                        }
+                    }
+                }
+            }
             let facts = labels::ContainerFacts {
                 id: &id,
                 name: &name,
                 labels: &labels_map,
                 exposed_ports: &ports,
-                network_aliases: BTreeMap::new(),
+                network_aliases: aliases,
             };
             if let Ok(spec) = labels::parse(facts, &self.defaults) {
                 specs.push(spec);
             }
         }
-        let hosts = self.npm.list_proxy_hosts().await?;
+        let npm = &self.npm;
+        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
         for intent in plan::plan(&specs, &hosts) {
             let _ = self.tx.send(intent).await;
         }
