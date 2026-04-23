@@ -77,6 +77,28 @@ Set `forward_host.strategy` in the config to choose. See [`examples/config.toml`
 
 Every proxy host this service creates carries an `npm_docker_sync` marker stored in NPM's `meta` field. The service only ever reads, updates, or deletes hosts that carry this marker. Any proxy host you create manually through the NPM UI is invisible to npm-docker-sync and will never be modified or removed. Cleanup on container removal is enabled by default and can be disabled by setting `cleanup.on_remove = false` in the config.
 
+## Metrics
+
+The service exposes an optional Prometheus-compatible `/metrics` endpoint. To enable, flip the flag in your config:
+
+```toml
+[metrics]
+enabled = true
+bind = "0.0.0.0:9090"
+```
+
+Exposed metrics:
+
+| Name | Type | Labels | Description |
+|------|------|--------|-------------|
+| `npm_docker_sync_intents_total` | counter | `kind`, `result` | Intents processed by the writer |
+| `npm_docker_sync_managed_hosts` | gauge | — | Proxy hosts currently owned by this service |
+| `npm_docker_sync_npm_request_duration_seconds` | histogram | `operation` | NPM API call latency |
+| `npm_docker_sync_retries_total` | counter | `kind` | Retry-wrapper events |
+| `npm_docker_sync_reconciler_sweep_lag_seconds` | gauge | — | Seconds since the last successful reconciler sweep |
+
+Import `examples/grafana-dashboard.json` into Grafana for a starter dashboard.
+
 ## Testing
 
 ```sh
@@ -88,6 +110,27 @@ cargo test --test e2e_smoke -- --ignored
 ```
 
 The smoke test boots a real Nginx Proxy Manager container, spawns the compiled binary as a subprocess, starts a labeled `nginx:alpine` container, and asserts that NPM creates and then removes the corresponding proxy host. It is opt-in (`#[ignore]`) and skipped by CI.
+
+## Secrets in the config file
+
+Each secret field in the config has two possible sources:
+
+- `field = "literal"` -- inline value in TOML.
+- `field_env = "NAME"` -- name of an env var holding the value.
+
+Rule: **TOML names the source of truth.** Env vars do NOT override inline literals. Setting both a literal and an env-var reference for the same field is a config error.
+
+| Field | Inline option | Env-var option | Default |
+|-------|---------------|----------------|---------|
+| NPM password | `password` | `password_env` | `NPM_PASSWORD` |
+| NPM token | `token` | `token_env` | — |
+| Cloudflare global token | `api_token` | `api_token_env` | `CF_API_TOKEN` |
+| Cloudflare per-domain | `{ token = "..." }` | `{ env = "..." }` | — |
+
+Recommendation:
+
+- **Production:** use `*_env` and deliver secrets via Docker / Kubernetes / your orchestrator's secret mechanism.
+- **Single-host / dev:** inline literals are fine, but the config file must be protected (file mode 0600, read-only bind mount, never committed to git).
 
 ## Building locally
 
