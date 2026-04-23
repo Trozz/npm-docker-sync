@@ -77,6 +77,18 @@ Set `forward_host.strategy` in the config to choose. See [`examples/config.toml`
 
 Every proxy host this service creates carries an `npm_docker_sync` marker stored in NPM's `meta` field. The service only ever reads, updates, or deletes hosts that carry this marker. Any proxy host you create manually through the NPM UI is invisible to npm-docker-sync and will never be modified or removed. Cleanup on container removal is enabled by default and can be disabled by setting `cleanup.on_remove = false` in the config.
 
+## Testing
+
+```sh
+# Unit tests + wiremock integration tests (no external dependencies)
+cargo test
+
+# End-to-end smoke test (requires a running Docker daemon and internet access to pull images)
+cargo test --test e2e_smoke -- --ignored
+```
+
+The smoke test boots a real Nginx Proxy Manager container, spawns the compiled binary as a subprocess, starts a labeled `nginx:alpine` container, and asserts that NPM creates and then removes the corresponding proxy host. It is opt-in (`#[ignore]`) and skipped by CI.
+
 ## Building locally
 
 Requires Rust stable 1.85 or later, plus `pkg-config` and `cmake` (needed by `aws-lc-rs`).
