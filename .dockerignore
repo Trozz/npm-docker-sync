@@ -4,3 +4,7 @@ target/
 docs/
 tests/
 examples/
+.env
+.env.*
+*.pem
+*.key

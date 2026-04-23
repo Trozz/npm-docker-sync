@@ -1,0 +1,61 @@
+# npm-docker-sync -- example configuration
+# Secrets never go in this file. Set them via environment variables
+# (see comments on each section).
+
+[npm]
+# Base URL of your Nginx Proxy Manager admin API.
+url = "http://nginx-proxy-manager:81"
+
+# Option A (default): email + password. NPM_PASSWORD env var is required.
+email = "admin@example.com"
+
+# Option B: use a pre-generated token. Uncomment and set token_env to
+# the name of the env var that holds the token. If set, token_env wins
+# over email/password.
+# token_env = "NPM_TOKEN"
+
+# Let's Encrypt registration email. Required when defaults.ssl = true.
+letsencrypt_email = "ops@example.com"
+
+[docker]
+# Path to Docker socket, or "tcp://host:port" for a remote daemon.
+socket = "/var/run/docker.sock"
+
+[forward_host]
+# How the service tells NPM to reach the target container:
+#   container_name  -- use the container's name (requires NPM on same Docker network)
+#   container_ip    -- use the container's IP on the named `network` below
+#   host_port       -- use `host_address` + the published port (cross-network)
+strategy = "container_name"
+# Used only when strategy = "container_ip".
+network = "proxy"
+# Used only when strategy = "host_port". Defaults to "host.docker.internal".
+# host_address = "192.168.1.10"
+
+[reconciler]
+# Seconds between reconciliation sweeps.
+interval_seconds = 300
+
+[cleanup]
+# When true (default), deleting a container removes its proxy host
+# (only for hosts this service created -- marked via NPM's meta field).
+on_remove = true
+
+[cloudflare]
+# Global CF API token comes from CF_API_TOKEN env var -- nothing to set here.
+# For per-domain overrides, map a domain to the NAME of an env var that
+# holds the token. Never put tokens inline in this file.
+[cloudflare.domains]
+# "example.com" = "CF_TOKEN_EXAMPLE"
+# "other.com"   = "CF_TOKEN_OTHER"
+
+[defaults]
+# Default values for any label not set on a container.
+scheme = "http"          # "http" or "https"
+ssl = true               # request LE cert via Cloudflare DNS-01
+websockets = true
+block_exploits = true
+
+[logging]
+level = "info"           # trace | debug | info | warn | error
+format = "json"          # json | pretty

@@ -1,0 +1,39 @@
+services:
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "81:81"
+      - "443:443"
+    networks:
+      - proxy
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+
+  npm-docker-sync:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: npm-docker-sync
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy-manager
+    environment:
+      NPM_PASSWORD: "${NPM_PASSWORD:?set in .env}"
+      CF_API_TOKEN: "${CF_API_TOKEN:?set in .env}"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "../examples/config.toml:/etc/npm-docker-sync/config.toml:ro"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    name: proxy
+
+volumes:
+  npm_data: {}
+  npm_letsencrypt: {}
