@@ -9,6 +9,7 @@ use npm_docker_sync::{
     config::{self, NpmCredential},
     docker::{DockerClient, labels::Defaults as LabelDefaults, watcher::Watcher},
     intent::Intent,
+    metrics,
     npm::NpmClient,
     npm::auth::Credential,
     reconciler::Reconciler,
@@ -30,6 +31,12 @@ async fn main() -> Result<()> {
     telemetry::init(&resolved.config.logging)
         .map_err(|e| anyhow::anyhow!("init telemetry: {e}"))?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
+
+    let _metrics_guard = metrics::init(&resolved.config.metrics)
+        .map_err(|e| anyhow::anyhow!("init metrics: {e}"))?;
+    if let Some(handle) = &_metrics_guard {
+        tracing::info!(bind = %handle.bound_addr(), "metrics endpoint listening");
+    }
 
     let cred = match &resolved.npm_credential {
         NpmCredential::EmailPassword { email, password } => Credential::EmailPassword {
