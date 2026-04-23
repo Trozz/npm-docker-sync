@@ -192,6 +192,18 @@ pub fn resolve_secrets(config: Config) -> Result<ResolvedConfig, ConfigError> {
             "defaults.ssl=true requires CF_API_TOKEN or per-domain cloudflare.domains".into(),
         ));
     }
+    if config.defaults.ssl
+        && config
+            .npm
+            .letsencrypt_email
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err(ConfigError::Validation(
+            "defaults.ssl=true requires npm.letsencrypt_email to be set and non-empty".into(),
+        ));
+    }
     Ok(ResolvedConfig {
         config,
         npm_credential,
@@ -311,6 +323,18 @@ mod tests {
         let cfg = base_config();
         with_env(&[("NPM_PASSWORD", "x")], || {
             unsafe { std::env::remove_var("CF_API_TOKEN") };
+            assert!(matches!(
+                resolve_secrets(cfg.clone()),
+                Err(ConfigError::Validation(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn ssl_default_with_no_letsencrypt_email_fails_validation() {
+        let mut cfg = base_config();
+        cfg.npm.letsencrypt_email = None;
+        with_env(&[("NPM_PASSWORD", "x"), ("CF_API_TOKEN", "tk")], || {
             assert!(matches!(
                 resolve_secrets(cfg.clone()),
                 Err(ConfigError::Validation(_))
