@@ -622,6 +622,21 @@ mod tests {
     }
 
     #[test]
+    fn token_and_token_env_both_set_fails() {
+        let mut cfg = base_config();
+        cfg.npm.email = None;
+        cfg.npm.password_env = None;
+        cfg.npm.token = Some("lit".into());
+        cfg.npm.token_env = Some("NPM_TOKEN".into());
+        with_env(&[("NPM_TOKEN", "env"), ("CF_API_TOKEN", "tk")], || {
+            assert!(matches!(
+                resolve_secrets(cfg.clone()),
+                Err(ConfigError::Validation(_))
+            ));
+        });
+    }
+
+    #[test]
     fn old_bare_string_domain_shape_rejected() {
         let s = r#"
 [npm]
