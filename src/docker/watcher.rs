@@ -137,11 +137,6 @@ impl Watcher {
                         aliases.insert(format!("{net}:ip"), ip);
                     }
                 }
-                if let Some(ref ar) = net_cfg.aliases {
-                    for a in ar {
-                        aliases.insert(format!("{net}:alias"), a.clone());
-                    }
-                }
             }
         }
         let facts = ContainerFacts {
