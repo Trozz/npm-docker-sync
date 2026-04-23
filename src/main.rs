@@ -86,7 +86,23 @@ async fn main() -> Result<()> {
     shutdown_signal().await;
     tracing::info!("shutdown requested");
     cancel.cancel();
-    let _ = tokio::join!(writer_handle, recon_handle, watcher_handle);
+    let join_fut = async {
+        let (w, r, wa) = tokio::join!(writer_handle, recon_handle, watcher_handle);
+        (w.is_err(), r.is_err(), wa.is_err())
+    };
+    match tokio::time::timeout(Duration::from_secs(10), join_fut).await {
+        Ok((we, re, wae)) => {
+            if we || re || wae {
+                tracing::warn!(
+                    writer_errored = we,
+                    reconciler_errored = re,
+                    watcher_errored = wae,
+                    "one or more tasks returned an error on shutdown"
+                );
+            }
+        }
+        Err(_) => tracing::error!("shutdown timed out after 10s — tasks still running"),
+    }
     Ok(())
 }
 
