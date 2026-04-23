@@ -43,13 +43,12 @@ impl DockerClient {
         }
     }
 
-    /// List all containers (running + stopped) that carry the `nginx_proxy_url` label.
+    /// List running containers that carry the `nginx_proxy_url` label.
     pub async fn list_labeled(&self) -> Result<Vec<ContainerSummary>, DockerError> {
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec!["nginx_proxy_url".to_string()]);
 
         let options = ListContainersOptionsBuilder::default()
-            .all(true)
             .filters(&filters)
             .build();
 
