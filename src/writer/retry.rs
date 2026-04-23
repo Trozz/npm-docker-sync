@@ -46,14 +46,18 @@ where
     E: std::fmt::Display,
 {
     let mut attempt: u32 = 0;
+    let mut auth_attempt: u32 = 0;
     loop {
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) => match classify(&e) {
                 FailKind::NonTransient => return Err(RetryError::NonTransient(e)),
                 FailKind::Unauthorized => {
+                    auth_attempt += 1;
+                    if auth_attempt >= policy.max_attempts {
+                        return Err(RetryError::Exhausted(e));
+                    }
                     on_unauthorized().await;
-                    // Don't consume attempt budget on 401.
                     continue;
                 }
                 FailKind::Transient => {
@@ -172,5 +176,26 @@ mod tests {
         .await;
         assert_eq!(res.unwrap(), 7);
         assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unauthorized_gives_up_after_max_attempts() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+        let res: Result<i32, RetryError<&str>> = retry_call(
+            &RetryPolicy::default(),
+            |_| FailKind::Unauthorized,
+            || async {},
+            || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err("401")
+                }
+            },
+        )
+        .await;
+        assert!(matches!(res, Err(RetryError::Exhausted(_))));
+        assert_eq!(call_count.load(Ordering::SeqCst), RetryPolicy::default().max_attempts);
     }
 }
