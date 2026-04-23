@@ -12,10 +12,63 @@ use crate::config::ForwardStrategy;
 use crate::docker::spec::{ContainerSpec, Scheme};
 use crate::intent::Intent;
 use crate::npm::NpmClient;
-use crate::npm::certificates::LetsEncryptRequest;
+use crate::npm::NpmError;
+use crate::npm::auth::AuthError;
+use crate::npm::certificates::{CertError, LetsEncryptRequest};
 use crate::npm::meta::{self, OwnershipMarker};
+use crate::npm::proxy_hosts::ProxyHostError;
 use crate::npm::types::{CreateProxyHost, UpdateProxyHost};
 use crate::writer::diff::{DesiredProxyHost, diff_spec};
+use crate::writer::retry::{FailKind, RetryError, RetryPolicy, retry_call};
+
+fn classify_npm(e: &NpmError) -> FailKind {
+    let status = match e {
+        NpmError::Auth(AuthError::Status(s)) => Some(*s),
+        NpmError::ProxyHost(ProxyHostError::Status(s)) => Some(*s),
+        NpmError::Cert(CertError::Status(s)) => Some(*s),
+        _ => None,
+    };
+    match status {
+        Some(401) => FailKind::Unauthorized,
+        Some(s) if (400..500).contains(&s) => FailKind::NonTransient,
+        Some(s) if s >= 500 || s == 429 => FailKind::Transient,
+        _ => {
+            let is_transport = matches!(
+                e,
+                NpmError::Auth(AuthError::Http(_))
+                    | NpmError::ProxyHost(ProxyHostError::Http(_))
+                    | NpmError::Cert(CertError::Http(_))
+            );
+            if is_transport {
+                FailKind::Transient
+            } else {
+                FailKind::NonTransient
+            }
+        }
+    }
+}
+
+async fn with_retry<T, F, Fut>(npm: &NpmClient, f: F) -> Result<T, NpmError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, NpmError>>,
+{
+    let policy = RetryPolicy::default();
+    retry_call(
+        &policy,
+        classify_npm,
+        || async {
+            if let Err(e) = npm.refresh_token().await {
+                tracing::warn!(error = %e, "token refresh failed during retry");
+            }
+        },
+        f,
+    )
+    .await
+    .map_err(|re| match re {
+        RetryError::Exhausted(e) | RetryError::NonTransient(e) => e,
+    })
+}
 
 pub struct WriterConfig {
     pub forward_strategy: ForwardStrategy,
@@ -56,7 +109,8 @@ impl NpmWriter {
 
     pub async fn run(mut self) {
         // Seed cache from NPM on startup.
-        match self.npm.list_proxy_hosts().await {
+        let npm = &self.npm;
+        match with_retry(npm, || npm.list_proxy_hosts()).await {
             Ok(hosts) => {
                 for h in hosts {
                     if let Some(m) = meta::decode(&h.meta) {
@@ -111,7 +165,8 @@ impl NpmWriter {
         spec: &ContainerSpec,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let forward_host = self.forward_host_for(spec);
-        let hosts = self.npm.list_proxy_hosts().await?;
+        let npm = &self.npm;
+        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
         let existing = hosts
             .iter()
             .find(|h| h.domain_names.iter().any(|d| d == &spec.url));
@@ -134,7 +189,9 @@ impl NpmWriter {
                         forward_host: &forward_host,
                     },
                 ) {
-                    self.npm.update_proxy_host(h.id, &patch).await?;
+                    let host_id = h.id;
+                    let npm = &self.npm;
+                    with_retry(npm, || npm.update_proxy_host(host_id, &patch)).await?;
                 }
                 self.cache.insert(container_id.to_string(), h.id);
             }
@@ -162,7 +219,8 @@ impl NpmWriter {
                     ssl_forced: false,
                     access_list_id: 0,
                 };
-                let created = self.npm.create_proxy_host(&body).await?;
+                let npm = &self.npm;
+                let created = with_retry(npm, || npm.create_proxy_host(&body)).await?;
                 self.cache.insert(container_id.to_string(), created.id);
 
                 if spec.ssl {
@@ -174,20 +232,19 @@ impl NpmWriter {
                         }
                     };
                     let credentials = format!("dns_cloudflare_api_token = {token}\n");
-                    let cert_id = self
-                        .npm
-                        .request_certificate(&LetsEncryptRequest {
-                            domain: spec.url.clone(),
-                            letsencrypt_email: self.cfg.letsencrypt_email.clone(),
-                            dns_provider_credentials: credentials,
-                        })
-                        .await?;
+                    let cert_req = LetsEncryptRequest {
+                        domain: spec.url.clone(),
+                        letsencrypt_email: self.cfg.letsencrypt_email.clone(),
+                        dns_provider_credentials: credentials,
+                    };
+                    let npm = &self.npm;
+                    let cert_id = with_retry(npm, || npm.request_certificate(&cert_req)).await?;
                     let mut patch = serde_json::Map::new();
                     patch.insert("certificate_id".into(), serde_json::Value::from(cert_id));
                     patch.insert("ssl_forced".into(), serde_json::Value::from(true));
-                    self.npm
-                        .update_proxy_host(created.id, &UpdateProxyHost(patch))
-                        .await?;
+                    let patch = UpdateProxyHost(patch);
+                    let npm = &self.npm;
+                    with_retry(npm, || npm.update_proxy_host(created.id, &patch)).await?;
                 }
             }
         }
@@ -205,7 +262,8 @@ impl NpmWriter {
             Some(id) => id,
             None => return Ok(()),
         };
-        let hosts = self.npm.list_proxy_hosts().await?;
+        let npm = &self.npm;
+        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
         let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
             self.cache.remove(container_id);
             return Ok(());
@@ -218,7 +276,8 @@ impl NpmWriter {
             tracing::warn!(host_id, "marker container_id mismatch; refusing to delete");
             return Ok(());
         }
-        self.npm.delete_proxy_host(host_id).await?;
+        let npm = &self.npm;
+        with_retry(npm, || npm.delete_proxy_host(host_id)).await?;
         self.cache.remove(container_id);
         Ok(())
     }
