@@ -69,6 +69,7 @@ impl NpmWriter {
             }
             Err(e) => tracing::warn!(error = %e, "initial cache seed failed"),
         }
+        metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -86,10 +87,24 @@ impl NpmWriter {
         &mut self,
         intent: Intent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match intent {
+        let kind_label = match &intent {
+            Intent::Upsert { .. } => "upsert",
+            Intent::Remove { .. } => "remove",
+        };
+        // Note: "skipped" outcomes (conflict, cleanup_on_remove=false) return Ok(())
+        // and are counted as "ok". Conflicts are logged at error level.
+        let result = match intent {
             Intent::Upsert { container_id, spec } => self.upsert(&container_id, &spec).await,
             Intent::Remove { container_id } => self.remove(&container_id).await,
-        }
+        };
+        let result_label = if result.is_ok() { "ok" } else { "error" };
+        metrics::counter!(
+            "npm_docker_sync_intents_total",
+            "kind" => kind_label,
+            "result" => result_label,
+        )
+        .increment(1);
+        result
     }
 
     fn forward_host_for(&self, spec: &ContainerSpec) -> String {
@@ -143,6 +158,7 @@ impl NpmWriter {
                     with_retry(npm, "update", || npm.update_proxy_host(host_id, &patch)).await?;
                 }
                 self.cache.insert(container_id.to_string(), h.id);
+                metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
             }
             None => {
                 let marker = OwnershipMarker {
@@ -171,6 +187,7 @@ impl NpmWriter {
                 let npm = &self.npm;
                 let created = with_retry(npm, "create", || npm.create_proxy_host(&body)).await?;
                 self.cache.insert(container_id.to_string(), created.id);
+                metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
 
                 if spec.ssl {
                     let token = match self.cf.for_domain(&spec.url) {
@@ -216,6 +233,7 @@ impl NpmWriter {
         let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
             self.cache.remove(container_id);
+            metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
             return Ok(());
         };
         let Some(marker) = meta::decode(&host.meta) else {
@@ -229,6 +247,7 @@ impl NpmWriter {
         let npm = &self.npm;
         with_retry(npm, "delete", || npm.delete_proxy_host(host_id)).await?;
         self.cache.remove(container_id);
+        metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
         Ok(())
     }
 }
