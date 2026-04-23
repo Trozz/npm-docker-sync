@@ -32,6 +32,8 @@ Watches Docker container labels and automatically creates, updates, and deletes 
    docker compose -f docker/docker-compose.example.yml up -d
    ```
 
+   Prefer the published image? `examples/docker-compose.yml` pulls `ghcr.io/trozz/npm-docker-sync:latest` instead of building from source. See `examples/.env.example` for the required env vars.
+
 4. Run a labeled container:
 
    ```sh

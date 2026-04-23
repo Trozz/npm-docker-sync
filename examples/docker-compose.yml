@@ -1,0 +1,66 @@
+# Example docker-compose stack using the published image from GHCR.
+#
+# Quick start:
+#   1. cp examples/docker-compose.yml .
+#   2. cp examples/config.toml .
+#   3. cp examples/.env.example .env    # then edit and fill in values
+#   4. Edit config.toml: set npm.email and npm.letsencrypt_email
+#   5. docker compose up -d
+#   6. Log into NPM at http://localhost:81 (default: admin@example.com / changeme)
+#      and change the admin password -- remember to update NPM_PASSWORD in .env
+#      to match before the service reconnects.
+
+services:
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "80:80"       # HTTP
+      - "81:81"       # NPM admin UI
+      - "443:443"     # HTTPS
+    networks:
+      - proxy
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+
+  npm-docker-sync:
+    image: ghcr.io/trozz/npm-docker-sync:latest
+    container_name: npm-docker-sync
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy-manager
+    environment:
+      NPM_PASSWORD: "${NPM_PASSWORD:?set in .env}"
+      CF_API_TOKEN: "${CF_API_TOKEN:?set in .env}"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./config.toml:/etc/npm-docker-sync/config.toml:ro"
+    # Uncomment to expose the Prometheus metrics endpoint
+    # (also flip [metrics].enabled = true in config.toml):
+    # ports:
+    #   - "9090:9090"
+    networks:
+      - proxy
+
+  # Example target container. The two labels tell npm-docker-sync to create
+  # a proxy host in NPM that forwards whoami.example.com -> this container's
+  # port 80. Replace with your own services or remove once verified.
+  example-whoami:
+    image: traefik/whoami:latest
+    container_name: example-whoami
+    restart: unless-stopped
+    labels:
+      nginx_proxy_url: whoami.example.com
+      nginx_proxy_port: "80"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    name: proxy
+
+volumes:
+  npm_data: {}
+  npm_letsencrypt: {}
