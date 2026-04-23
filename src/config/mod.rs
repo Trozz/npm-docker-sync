@@ -3,7 +3,7 @@ pub mod secrets;
 use self::secrets::SecretError;
 use crate::docker::spec::Scheme;
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, net::SocketAddr, path::Path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -34,12 +34,17 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NpmConfig {
     pub url: String,
     pub email: Option<String>,
+    pub password: Option<String>,
+    pub password_env: Option<String>,
+    pub token: Option<String>,
     pub token_env: Option<String>,
     pub letsencrypt_email: Option<String>,
 }
@@ -104,8 +109,60 @@ impl Default for CleanupConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CloudflareConfig {
+    pub api_token: Option<String>,
+    pub api_token_env: Option<String>,
     #[serde(default)]
-    pub domains: BTreeMap<String, String>,
+    pub domains: BTreeMap<String, DomainToken>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DomainToken {
+    Env(String),
+    Token(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainTokenRaw {
+    env: Option<String>,
+    token: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for DomainToken {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = DomainTokenRaw::deserialize(d)?;
+        match (raw.env, raw.token) {
+            (Some(e), None) => Ok(DomainToken::Env(e)),
+            (None, Some(t)) => Ok(DomainToken::Token(t)),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "cloudflare.domains entry has both `env` and `token`; set exactly one",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "cloudflare.domains entry must set either `env` or `token`",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_bind")]
+    pub bind: SocketAddr,
+}
+
+fn default_metrics_bind() -> SocketAddr {
+    "0.0.0.0:9090".parse().unwrap()
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_metrics_bind(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,6 +218,36 @@ pub enum NpmCredential {
     Token(String),
 }
 
+enum SecretSource {
+    Literal(String),
+    EnvName(String),
+}
+
+impl SecretSource {
+    fn resolve(self) -> Result<String, SecretError> {
+        match self {
+            SecretSource::Literal(s) => Ok(s),
+            SecretSource::EnvName(name) => secrets::require(&name),
+        }
+    }
+
+    fn from_pair(
+        field: &str,
+        inline: Option<String>,
+        env_name: Option<String>,
+        default_env: Option<&str>,
+    ) -> Result<Option<Self>, ConfigError> {
+        match (inline, env_name) {
+            (Some(_), Some(_)) => Err(ConfigError::Validation(format!(
+                "{field}: set either {field} or {field}_env, not both"
+            ))),
+            (Some(v), None) => Ok(Some(SecretSource::Literal(v))),
+            (None, Some(n)) => Ok(Some(SecretSource::EnvName(n))),
+            (None, None) => Ok(default_env.map(|n| SecretSource::EnvName(n.to_string()))),
+        }
+    }
+}
+
 pub fn load(path: &Path) -> Result<ResolvedConfig, ConfigError> {
     let text = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&text)?;
@@ -168,30 +255,68 @@ pub fn load(path: &Path) -> Result<ResolvedConfig, ConfigError> {
 }
 
 pub fn resolve_secrets(config: Config) -> Result<ResolvedConfig, ConfigError> {
-    let npm_credential = if let Some(env_name) = &config.npm.token_env {
-        NpmCredential::Token(secrets::require(env_name)?)
+    let has_token = config.npm.token.is_some() || config.npm.token_env.is_some();
+    let has_email = config.npm.email.is_some();
+    if has_token && has_email {
+        return Err(ConfigError::Validation(
+            "npm: set either email/password or token, not both".into(),
+        ));
+    }
+
+    let npm_credential = if has_token {
+        let source = SecretSource::from_pair(
+            "npm.token",
+            config.npm.token.clone(),
+            config.npm.token_env.clone(),
+            None,
+        )?
+        .ok_or_else(|| ConfigError::Validation("npm.token or npm.token_env required".into()))?;
+        NpmCredential::Token(source.resolve()?)
     } else if let Some(email) = &config.npm.email {
-        let password = secrets::require("NPM_PASSWORD")?;
+        let source = SecretSource::from_pair(
+            "npm.password",
+            config.npm.password.clone(),
+            config.npm.password_env.clone(),
+            Some("NPM_PASSWORD"),
+        )?
+        .ok_or_else(|| {
+            ConfigError::Validation("npm.password or npm.password_env required".into())
+        })?;
         NpmCredential::EmailPassword {
             email: email.clone(),
-            password,
+            password: source.resolve()?,
         }
     } else {
         return Err(ConfigError::Validation(
-            "npm.email or npm.token_env required".into(),
+            "npm.email (with password) or npm.token required".into(),
         ));
     };
 
-    let cloudflare_global = secrets::optional("CF_API_TOKEN");
+    let cloudflare_global = match SecretSource::from_pair(
+        "cloudflare.api_token",
+        config.cloudflare.api_token.clone(),
+        config.cloudflare.api_token_env.clone(),
+        Some("CF_API_TOKEN"),
+    )? {
+        Some(s) => s.resolve().ok(),
+        None => None,
+    };
+
     let mut cloudflare_per_domain = BTreeMap::new();
-    for (domain, env_name) in &config.cloudflare.domains {
-        cloudflare_per_domain.insert(domain.clone(), secrets::require(env_name)?);
+    for (domain, entry) in &config.cloudflare.domains {
+        let token = match entry {
+            DomainToken::Env(env) => secrets::require(env)?,
+            DomainToken::Token(token) => token.clone(),
+        };
+        cloudflare_per_domain.insert(domain.clone(), token);
     }
+
     if config.defaults.ssl && cloudflare_global.is_none() && cloudflare_per_domain.is_empty() {
         return Err(ConfigError::Validation(
-            "defaults.ssl=true requires CF_API_TOKEN or per-domain cloudflare.domains".into(),
+            "defaults.ssl=true requires cloudflare.api_token(_env) or per-domain overrides".into(),
         ));
     }
+
     if config.defaults.ssl
         && config
             .npm
@@ -204,6 +329,7 @@ pub fn resolve_secrets(config: Config) -> Result<ResolvedConfig, ConfigError> {
             "defaults.ssl=true requires npm.letsencrypt_email to be set and non-empty".into(),
         ));
     }
+
     Ok(ResolvedConfig {
         config,
         npm_credential,
@@ -243,6 +369,9 @@ mod tests {
             npm: NpmConfig {
                 url: "http://npm".into(),
                 email: Some("a@b".into()),
+                password: None,
+                password_env: Some("NPM_PASSWORD".into()),
+                token: None,
                 token_env: None,
                 letsencrypt_email: Some("a@b".into()),
             },
@@ -250,15 +379,20 @@ mod tests {
             forward_host: ForwardHostConfig::default(),
             reconciler: ReconcilerConfig::default(),
             cleanup: CleanupConfig::default(),
-            cloudflare: CloudflareConfig::default(),
+            cloudflare: CloudflareConfig {
+                api_token_env: Some("CF_API_TOKEN".into()),
+                ..CloudflareConfig::default()
+            },
             defaults: Defaults::default(),
             logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 
     #[test]
     fn email_password_requires_npm_password() {
-        let cfg = base_config();
+        let mut cfg = base_config();
+        cfg.npm.password_env = None;
         with_env(&[], || {
             unsafe { std::env::remove_var("NPM_PASSWORD") };
             let r = resolve_secrets(cfg.clone());
@@ -290,7 +424,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.cloudflare
             .domains
-            .insert("example.com".into(), "CF_TOKEN_EX".into());
+            .insert("example.com".into(), DomainToken::Env("CF_TOKEN_EX".into()));
         with_env(
             &[
                 ("NPM_PASSWORD", "x"),
@@ -311,6 +445,7 @@ mod tests {
     fn token_credential_happy_path() {
         let mut cfg = base_config();
         cfg.npm.email = None;
+        cfg.npm.password_env = None;
         cfg.npm.token_env = Some("NPM_TOKEN".into());
         with_env(&[("NPM_TOKEN", "jwt"), ("CF_API_TOKEN", "x")], || {
             let r = resolve_secrets(cfg.clone()).unwrap();
@@ -320,7 +455,8 @@ mod tests {
 
     #[test]
     fn ssl_default_with_no_cf_token_fails_validation() {
-        let cfg = base_config();
+        let mut cfg = base_config();
+        cfg.cloudflare.api_token_env = None;
         with_env(&[("NPM_PASSWORD", "x")], || {
             unsafe { std::env::remove_var("CF_API_TOKEN") };
             assert!(matches!(
@@ -340,5 +476,207 @@ mod tests {
                 Err(ConfigError::Validation(_))
             ));
         });
+    }
+
+    #[test]
+    fn metrics_defaults_to_disabled() {
+        let cfg = base_config();
+        with_env(&[("NPM_PASSWORD", "x"), ("CF_API_TOKEN", "tk")], || {
+            let r = resolve_secrets(cfg.clone()).unwrap();
+            assert!(!r.config.metrics.enabled);
+        });
+    }
+
+    #[test]
+    fn password_literal_path() {
+        let mut cfg = base_config();
+        cfg.npm.password = Some("lit".into());
+        cfg.npm.password_env = None;
+        with_env(&[("CF_API_TOKEN", "tk")], || {
+            let r = resolve_secrets(cfg.clone()).unwrap();
+            assert!(matches!(
+                r.npm_credential,
+                NpmCredential::EmailPassword { password, .. } if password == "lit"
+            ));
+        });
+    }
+
+    #[test]
+    fn password_env_path() {
+        let mut cfg = base_config();
+        cfg.npm.password_env = Some("SOMETHING_ELSE".into());
+        with_env(
+            &[("SOMETHING_ELSE", "env-val"), ("CF_API_TOKEN", "tk")],
+            || {
+                let r = resolve_secrets(cfg.clone()).unwrap();
+                assert!(matches!(
+                    r.npm_credential,
+                    NpmCredential::EmailPassword { password, .. } if password == "env-val"
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn password_defaults_to_npm_password_env() {
+        let mut cfg = base_config();
+        cfg.npm.password = None;
+        cfg.npm.password_env = None;
+        with_env(
+            &[("NPM_PASSWORD", "default-env"), ("CF_API_TOKEN", "tk")],
+            || {
+                let r = resolve_secrets(cfg.clone()).unwrap();
+                assert!(matches!(
+                    r.npm_credential,
+                    NpmCredential::EmailPassword { password, .. } if password == "default-env"
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn password_and_password_env_both_set_fails() {
+        let mut cfg = base_config();
+        cfg.npm.password = Some("lit".into());
+        cfg.npm.password_env = Some("NPM_PASSWORD".into());
+        with_env(&[("NPM_PASSWORD", "env"), ("CF_API_TOKEN", "tk")], || {
+            assert!(matches!(
+                resolve_secrets(cfg.clone()),
+                Err(ConfigError::Validation(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn token_and_email_both_set_fails() {
+        let mut cfg = base_config();
+        cfg.npm.token_env = Some("NPM_TOKEN".into());
+        with_env(
+            &[
+                ("NPM_TOKEN", "jwt"),
+                ("CF_API_TOKEN", "tk"),
+                ("NPM_PASSWORD", "pw"),
+            ],
+            || {
+                assert!(matches!(
+                    resolve_secrets(cfg.clone()),
+                    Err(ConfigError::Validation(_))
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn token_literal_path() {
+        let mut cfg = base_config();
+        cfg.npm.email = None;
+        cfg.npm.password_env = None;
+        cfg.npm.token = Some("literal-jwt".into());
+        with_env(&[("CF_API_TOKEN", "tk")], || {
+            let r = resolve_secrets(cfg.clone()).unwrap();
+            assert!(matches!(r.npm_credential, NpmCredential::Token(t) if t == "literal-jwt"));
+        });
+    }
+
+    #[test]
+    fn api_token_literal_path() {
+        let mut cfg = base_config();
+        cfg.cloudflare.api_token = Some("cf-literal".into());
+        cfg.cloudflare.api_token_env = None;
+        with_env(&[("NPM_PASSWORD", "x")], || {
+            unsafe { std::env::remove_var("CF_API_TOKEN") };
+            let r = resolve_secrets(cfg.clone()).unwrap();
+            assert_eq!(r.cloudflare_global.as_deref(), Some("cf-literal"));
+        });
+    }
+
+    #[test]
+    fn api_token_and_env_both_set_fails() {
+        let mut cfg = base_config();
+        cfg.cloudflare.api_token = Some("lit".into());
+        cfg.cloudflare.api_token_env = Some("CF_API_TOKEN".into());
+        with_env(&[("NPM_PASSWORD", "x"), ("CF_API_TOKEN", "tk")], || {
+            assert!(matches!(
+                resolve_secrets(cfg.clone()),
+                Err(ConfigError::Validation(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn domain_env_form_resolves() {
+        let mut cfg = base_config();
+        cfg.cloudflare
+            .domains
+            .insert("ex.com".into(), DomainToken::Env("CF_TOKEN_EX".into()));
+        with_env(
+            &[
+                ("NPM_PASSWORD", "x"),
+                ("CF_API_TOKEN", "g"),
+                ("CF_TOKEN_EX", "scoped"),
+            ],
+            || {
+                let r = resolve_secrets(cfg.clone()).unwrap();
+                assert_eq!(r.cloudflare_per_domain.get("ex.com").unwrap(), "scoped");
+            },
+        );
+    }
+
+    #[test]
+    fn domain_token_form_resolves() {
+        let mut cfg = base_config();
+        cfg.cloudflare
+            .domains
+            .insert("ex.com".into(), DomainToken::Token("literal".into()));
+        with_env(&[("NPM_PASSWORD", "x"), ("CF_API_TOKEN", "g")], || {
+            let r = resolve_secrets(cfg.clone()).unwrap();
+            assert_eq!(r.cloudflare_per_domain.get("ex.com").unwrap(), "literal");
+        });
+    }
+
+    #[test]
+    fn token_and_token_env_both_set_fails() {
+        let mut cfg = base_config();
+        cfg.npm.email = None;
+        cfg.npm.password_env = None;
+        cfg.npm.token = Some("lit".into());
+        cfg.npm.token_env = Some("NPM_TOKEN".into());
+        with_env(&[("NPM_TOKEN", "env"), ("CF_API_TOKEN", "tk")], || {
+            assert!(matches!(
+                resolve_secrets(cfg.clone()),
+                Err(ConfigError::Validation(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn domain_both_env_and_token_fails_at_parse() {
+        let s = r#"
+[npm]
+url = "http://npm"
+email = "a@b"
+letsencrypt_email = "a@b"
+[cloudflare.domains]
+"example.com" = { env = "CF_TOKEN_EX", token = "literal" }
+"#;
+        let err = toml::from_str::<Config>(s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both") || msg.contains("env") || msg.contains("token"),
+            "error message should mention the conflict: {msg}"
+        );
+    }
+
+    #[test]
+    fn old_bare_string_domain_shape_rejected() {
+        let s = r#"
+[npm]
+url = "http://npm"
+email = "a@b"
+letsencrypt_email = "a@b"
+[cloudflare.domains]
+"example.com" = "CF_TOKEN_EX"
+"#;
+        assert!(toml::from_str::<Config>(s).is_err());
     }
 }

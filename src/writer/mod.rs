@@ -4,6 +4,12 @@ pub(crate) mod retry_npm;
 
 use std::collections::{BTreeMap, HashMap};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleOutcome {
+    Applied,
+    Skipped,
+}
+
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +65,7 @@ impl NpmWriter {
     pub async fn run(mut self) {
         // Seed cache from NPM on startup.
         let npm = &self.npm;
-        match with_retry(npm, || npm.list_proxy_hosts()).await {
+        match with_retry(npm, "list", || npm.list_proxy_hosts()).await {
             Ok(hosts) => {
                 for h in hosts {
                     if let Some(m) = meta::decode(&h.meta) {
@@ -69,6 +75,7 @@ impl NpmWriter {
             }
             Err(e) => tracing::warn!(error = %e, "initial cache seed failed"),
         }
+        metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => return,
@@ -86,10 +93,26 @@ impl NpmWriter {
         &mut self,
         intent: Intent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match intent {
+        let kind_label = match &intent {
+            Intent::Upsert { .. } => "upsert",
+            Intent::Remove { .. } => "remove",
+        };
+        let result = match intent {
             Intent::Upsert { container_id, spec } => self.upsert(&container_id, &spec).await,
             Intent::Remove { container_id } => self.remove(&container_id).await,
-        }
+        };
+        let result_label = match &result {
+            Ok(HandleOutcome::Applied) => "ok",
+            Ok(HandleOutcome::Skipped) => "skipped",
+            Err(_) => "error",
+        };
+        metrics::counter!(
+            "npm_docker_sync_intents_total",
+            "kind" => kind_label,
+            "result" => result_label,
+        )
+        .increment(1);
+        result.map(|_| ())
     }
 
     fn forward_host_for(&self, spec: &ContainerSpec) -> String {
@@ -112,10 +135,10 @@ impl NpmWriter {
         &mut self,
         container_id: &str,
         spec: &ContainerSpec,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HandleOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let forward_host = self.forward_host_for(spec);
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         let existing = hosts
             .iter()
             .find(|h| h.domain_names.iter().any(|d| d == &spec.url));
@@ -129,7 +152,7 @@ impl NpmWriter {
                         host_id = h.id,
                         "conflict: host exists for another owner, skipping"
                     );
-                    return Ok(());
+                    return Ok(HandleOutcome::Skipped);
                 }
                 if let Some(patch) = diff_spec(
                     h,
@@ -140,9 +163,10 @@ impl NpmWriter {
                 ) {
                     let host_id = h.id;
                     let npm = &self.npm;
-                    with_retry(npm, || npm.update_proxy_host(host_id, &patch)).await?;
+                    with_retry(npm, "update", || npm.update_proxy_host(host_id, &patch)).await?;
                 }
                 self.cache.insert(container_id.to_string(), h.id);
+                metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
             }
             None => {
                 let marker = OwnershipMarker {
@@ -169,15 +193,16 @@ impl NpmWriter {
                     access_list_id: 0,
                 };
                 let npm = &self.npm;
-                let created = with_retry(npm, || npm.create_proxy_host(&body)).await?;
+                let created = with_retry(npm, "create", || npm.create_proxy_host(&body)).await?;
                 self.cache.insert(container_id.to_string(), created.id);
+                metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
 
                 if spec.ssl {
                     let token = match self.cf.for_domain(&spec.url) {
                         Ok(t) => t.to_string(),
                         Err(e) => {
                             tracing::error!(error = %e, "no CF token, skipping cert");
-                            return Ok(());
+                            return Ok(HandleOutcome::Skipped);
                         }
                     };
                     let credentials = format!("dns_cloudflare_api_token = {token}\n");
@@ -187,47 +212,50 @@ impl NpmWriter {
                         dns_provider_credentials: credentials,
                     };
                     let npm = &self.npm;
-                    let cert_id = with_retry(npm, || npm.request_certificate(&cert_req)).await?;
+                    let cert_id =
+                        with_retry(npm, "cert", || npm.request_certificate(&cert_req)).await?;
                     let mut patch = serde_json::Map::new();
                     patch.insert("certificate_id".into(), serde_json::Value::from(cert_id));
                     patch.insert("ssl_forced".into(), serde_json::Value::from(true));
                     let patch = UpdateProxyHost(patch);
                     let npm = &self.npm;
-                    with_retry(npm, || npm.update_proxy_host(created.id, &patch)).await?;
+                    with_retry(npm, "update", || npm.update_proxy_host(created.id, &patch)).await?;
                 }
             }
         }
-        Ok(())
+        Ok(HandleOutcome::Applied)
     }
 
     async fn remove(
         &mut self,
         container_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HandleOutcome, Box<dyn std::error::Error + Send + Sync>> {
         if !self.cfg.cleanup_on_remove {
-            return Ok(());
+            return Ok(HandleOutcome::Skipped);
         }
         let host_id = match self.cache.get(container_id).copied() {
             Some(id) => id,
-            None => return Ok(()),
+            None => return Ok(HandleOutcome::Skipped),
         };
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         let Some(host) = hosts.iter().find(|h| h.id == host_id) else {
             self.cache.remove(container_id);
-            return Ok(());
+            metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
+            return Ok(HandleOutcome::Skipped);
         };
         let Some(marker) = meta::decode(&host.meta) else {
             tracing::warn!(host_id, "refuse to delete host without ownership marker");
-            return Ok(());
+            return Ok(HandleOutcome::Skipped);
         };
         if marker.container_id != container_id {
             tracing::warn!(host_id, "marker container_id mismatch; refusing to delete");
-            return Ok(());
+            return Ok(HandleOutcome::Skipped);
         }
         let npm = &self.npm;
-        with_retry(npm, || npm.delete_proxy_host(host_id)).await?;
+        with_retry(npm, "delete", || npm.delete_proxy_host(host_id)).await?;
         self.cache.remove(container_id);
-        Ok(())
+        metrics::gauge!("npm_docker_sync_managed_hosts").set(self.cache.len() as f64);
+        Ok(HandleOutcome::Applied)
     }
 }

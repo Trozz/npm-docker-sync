@@ -22,15 +22,16 @@ pub struct Reconciler {
 
 impl Reconciler {
     pub async fn run(self) {
+        let mut last_sweep_success = std::time::Instant::now();
         // One immediate sweep at startup.
-        if let Err(e) = self.sweep().await {
+        if let Err(e) = self.sweep(&mut last_sweep_success).await {
             tracing::warn!(error = %e, "initial reconciliation sweep failed");
         }
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => return,
                 _ = tokio::time::sleep(self.interval) => {
-                    if let Err(e) = self.sweep().await {
+                    if let Err(e) = self.sweep(&mut last_sweep_success).await {
                         tracing::warn!(error = %e, "reconciliation sweep failed");
                     }
                 }
@@ -38,7 +39,12 @@ impl Reconciler {
         }
     }
 
-    async fn sweep(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn sweep(
+        &self,
+        last_sweep_success: &mut std::time::Instant,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let lag = last_sweep_success.elapsed().as_secs_f64();
+        metrics::gauge!("npm_docker_sync_reconciler_sweep_lag_seconds").set(lag);
         let summaries = self.docker.list_labeled().await?;
         let mut specs = Vec::new();
         for s in summaries {
@@ -90,10 +96,12 @@ impl Reconciler {
             }
         }
         let npm = &self.npm;
-        let hosts = with_retry(npm, || npm.list_proxy_hosts()).await?;
+        let hosts = with_retry(npm, "list", || npm.list_proxy_hosts()).await?;
         for intent in plan::plan(&specs, &hosts) {
             let _ = self.tx.send(intent).await;
         }
+        *last_sweep_success = std::time::Instant::now();
+        metrics::gauge!("npm_docker_sync_reconciler_sweep_lag_seconds").set(0.0);
         Ok(())
     }
 }

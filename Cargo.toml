@@ -19,6 +19,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
 futures-util = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 rand = "0.9"
 clap = { version = "4", features = ["derive"] }
