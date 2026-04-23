@@ -115,11 +115,33 @@ pub struct CloudflareConfig {
     pub domains: BTreeMap<String, DomainToken>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum DomainToken {
-    Env { env: String },
-    Token { token: String },
+    Env(String),
+    Token(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainTokenRaw {
+    env: Option<String>,
+    token: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for DomainToken {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = DomainTokenRaw::deserialize(d)?;
+        match (raw.env, raw.token) {
+            (Some(e), None) => Ok(DomainToken::Env(e)),
+            (None, Some(t)) => Ok(DomainToken::Token(t)),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "cloudflare.domains entry has both `env` and `token`; set exactly one",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "cloudflare.domains entry must set either `env` or `token`",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,8 +305,8 @@ pub fn resolve_secrets(config: Config) -> Result<ResolvedConfig, ConfigError> {
     let mut cloudflare_per_domain = BTreeMap::new();
     for (domain, entry) in &config.cloudflare.domains {
         let token = match entry {
-            DomainToken::Env { env } => secrets::require(env)?,
-            DomainToken::Token { token } => token.clone(),
+            DomainToken::Env(env) => secrets::require(env)?,
+            DomainToken::Token(token) => token.clone(),
         };
         cloudflare_per_domain.insert(domain.clone(), token);
     }
@@ -400,12 +422,9 @@ mod tests {
     #[test]
     fn per_domain_cf_env_vars_resolved() {
         let mut cfg = base_config();
-        cfg.cloudflare.domains.insert(
-            "example.com".into(),
-            DomainToken::Env {
-                env: "CF_TOKEN_EX".into(),
-            },
-        );
+        cfg.cloudflare
+            .domains
+            .insert("example.com".into(), DomainToken::Env("CF_TOKEN_EX".into()));
         with_env(
             &[
                 ("NPM_PASSWORD", "x"),
@@ -587,12 +606,9 @@ mod tests {
     #[test]
     fn domain_env_form_resolves() {
         let mut cfg = base_config();
-        cfg.cloudflare.domains.insert(
-            "ex.com".into(),
-            DomainToken::Env {
-                env: "CF_TOKEN_EX".into(),
-            },
-        );
+        cfg.cloudflare
+            .domains
+            .insert("ex.com".into(), DomainToken::Env("CF_TOKEN_EX".into()));
         with_env(
             &[
                 ("NPM_PASSWORD", "x"),
@@ -609,12 +625,9 @@ mod tests {
     #[test]
     fn domain_token_form_resolves() {
         let mut cfg = base_config();
-        cfg.cloudflare.domains.insert(
-            "ex.com".into(),
-            DomainToken::Token {
-                token: "literal".into(),
-            },
-        );
+        cfg.cloudflare
+            .domains
+            .insert("ex.com".into(), DomainToken::Token("literal".into()));
         with_env(&[("NPM_PASSWORD", "x"), ("CF_API_TOKEN", "g")], || {
             let r = resolve_secrets(cfg.clone()).unwrap();
             assert_eq!(r.cloudflare_per_domain.get("ex.com").unwrap(), "literal");
@@ -634,6 +647,24 @@ mod tests {
                 Err(ConfigError::Validation(_))
             ));
         });
+    }
+
+    #[test]
+    fn domain_both_env_and_token_fails_at_parse() {
+        let s = r#"
+[npm]
+url = "http://npm"
+email = "a@b"
+letsencrypt_email = "a@b"
+[cloudflare.domains]
+"example.com" = { env = "CF_TOKEN_EX", token = "literal" }
+"#;
+        let err = toml::from_str::<Config>(s).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both") || msg.contains("env") || msg.contains("token"),
+            "error message should mention the conflict: {msg}"
+        );
     }
 
     #[test]
