@@ -196,6 +196,9 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Err(RetryError::Exhausted(_))));
-        assert_eq!(call_count.load(Ordering::SeqCst), RetryPolicy::default().max_attempts);
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            RetryPolicy::default().max_attempts
+        );
     }
 }
